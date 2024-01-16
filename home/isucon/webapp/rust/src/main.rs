@@ -1621,7 +1621,7 @@ async fn register_handler(
 
     let output = tokio::process::Command::new("pdnsutil")
         .arg("add-record")
-        .arg("u.isucon.pw")
+        .arg("t.isucon.pw")
         .arg(&req.name)
         .arg("A")
         .arg("0")
@@ -1695,7 +1695,7 @@ async fn login_handler(
     if let Some(cookie_value) = cookie_store.store_session(sess).await? {
         let cookie =
             axum_extra::extract::cookie::Cookie::build(DEFAULT_SESSION_ID_KEY, cookie_value)
-                .domain("u.isucon.pw")
+                .domain("t.isucon.pw")
                 .max_age(time::Duration::minutes(1000))
                 .path("/")
                 .finish();
