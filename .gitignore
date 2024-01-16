@@ -2,6 +2,12 @@
 !.gitignore
 !.vscode
 !.vscode/**
+!init.yml
+!hosts.yml
+!README.md
+!Makefile
+!ssh
+!ssh/config
 !opt
 !opt/init_zone_once.sh
 !etc

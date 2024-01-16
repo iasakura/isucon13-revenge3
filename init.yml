@@ -1,0 +1,40 @@
+- name: init
+  hosts: all
+
+  tasks:
+    - name: enable rust
+      become: yes
+      become_user: root
+      ansible.builtin.shell: |
+        systemctl stop isupipe-go
+        systemctl disable isupipe-go
+        systemctl enable isupipe-rust
+        systemctl start isupipe-rust
+
+    - name: copy keys
+      become: yes
+      become_user: root
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: /root/.ssh
+      with_fileglob:
+        - ./ssh/*
+
+    - name: chmod keys
+      become: yes
+      become_user: root
+      ansible.builtin.shell: |
+        chmod 600 /root/.ssh/id_ed25519
+
+    - name: deploy
+      become: yes
+      become_user: root
+      ansible.builtin.shell: |
+        cd /
+        git init . || true
+        git checkout -b main
+        git remote add origin git@github.com:iasakura/isucon13-revenge2.git
+        git fetch
+        git reset --hard origin/main
+      args:
+        chdir: /
