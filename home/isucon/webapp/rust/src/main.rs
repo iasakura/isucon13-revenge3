@@ -1732,6 +1732,7 @@ async fn get_user_handler(
 }
 
 async fn verify_user_session(jar: &SignedCookieJar) -> Result<(), Error> {
+    tracing::info!("x");
     let cookie = jar
         .get(DEFAULT_SESSION_ID_KEY)
         .ok_or(Error::Forbidden("".into()))?;
