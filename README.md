@@ -10,6 +10,8 @@ ssh-keygen -t ed25519 ssh/id_ed25519
 
 ### Ansible
 
+#### デプロイ
+
 hosts.ymlの各サーバーのIPアドレスを書き換える。
 その後以下を実行。
 
@@ -24,3 +26,4 @@ ansible-playbook -i hosts.yml init.yml
 ```
 ansible-playbook -i hosts.yml update.yml
 ```
+

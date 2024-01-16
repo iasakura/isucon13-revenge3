@@ -39,3 +39,7 @@
         git reset --hard origin/main
       args:
         chdir: /
+
+    - name: update
+      ansible.builtin.shell: |
+        PATH=$HOME/.cargo/bin:$PATH make deploy
