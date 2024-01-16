@@ -23,3 +23,9 @@ ALTER TABLE `tags` auto_increment = 1;
 ALTER TABLE `livecomments` auto_increment = 1;
 ALTER TABLE `livestreams` auto_increment = 1;
 ALTER TABLE `users` auto_increment = 1;
+
+ALTER TABLE `users` auto_increment = 1;
+
+SET GLOBAL slow_query_log=1;
+SET GLOBAL slow_query_log_file='/tmp/slow.log';
+SET GLOBAL long_query_time=0;

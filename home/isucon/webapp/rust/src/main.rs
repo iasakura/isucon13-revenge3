@@ -3,9 +3,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum_extra::extract::cookie::SignedCookieJar;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use hyper::header::IF_NONE_MATCH;
+use hyper::HeaderMap;
+use sha2::digest::Digest as _;
 use sqlx::mysql::{MySqlConnection, MySqlPool};
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const DEFAULT_SESSION_ID_KEY: &str = "SESSIONID";
@@ -72,6 +77,8 @@ struct AppState {
     pool: MySqlPool,
     key: axum_extra::extract::cookie::Key,
     powerdns_subdomain_address: Arc<String>,
+    // SHA256 Map of all images
+    image_hashes: Arc<RwLock<HashMap<String, String>>>,
 }
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {
     fn from_ref(state: &AppState) -> Self {
@@ -254,6 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool,
             key: axum_extra::extract::cookie::Key::derive_from(&secret),
             powerdns_subdomain_address: Arc::new(powerdns_subdomain_address),
+            image_hashes: Arc::new(RwLock::new(HashMap::new())),
         })
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
@@ -1444,16 +1452,37 @@ struct PostIconResponse {
     id: i64,
 }
 
+fn compute_icon_hash(icon: &[u8]) -> String {
+    format!("{:x}", sha2::Sha256::digest(icon))
+}
+
 async fn get_icon_handler(
-    State(AppState { pool, .. }): State<AppState>,
+    State(AppState {
+        pool, image_hashes, ..
+    }): State<AppState>,
     Path((username,)): Path<(String,)>,
+    headers: HeaderMap,
 ) -> Result<axum::response::Response, Error> {
     use axum::response::IntoResponse as _;
 
     let mut tx = pool.begin().await?;
 
+    if let Some(queried_hash) = headers
+        .get(IF_NONE_MATCH)
+        .and_then(|h| std::str::from_utf8(h.as_bytes()).ok())
+        .map(|s| s.trim_matches('"'))
+    {
+        tracing::info!("queried: {:?}", queried_hash);
+        if let Some(hash) = image_hashes.read().await.get(&username) {
+            tracing::info!("cached: {:?}", hash);
+            if hash.as_str() == queried_hash {
+                return Ok(StatusCode::NOT_MODIFIED.into_response());
+            }
+        }
+    }
+
     let user: UserModel = sqlx::query_as("SELECT * FROM users WHERE name = ?")
-        .bind(username)
+        .bind(&username)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -1464,6 +1493,10 @@ async fn get_icon_handler(
 
     let headers = [(axum::http::header::CONTENT_TYPE, "image/jpeg")];
     if let Some(image) = image {
+        image_hashes
+            .write()
+            .await
+            .insert(username.clone(), compute_icon_hash(&image));
         Ok((headers, image).into_response())
     } else {
         let file = tokio::fs::File::open(FALLBACK_IMAGE).await.unwrap();
@@ -1475,7 +1508,9 @@ async fn get_icon_handler(
 }
 
 async fn post_icon_handler(
-    State(AppState { pool, .. }): State<AppState>,
+    State(AppState {
+        pool, image_hashes, ..
+    }): State<AppState>,
     jar: SignedCookieJar,
     axum::Json(req): axum::Json<PostIconRequest>,
 ) -> Result<(StatusCode, axum::Json<PostIconResponse>), Error> {
@@ -1494,6 +1529,14 @@ async fn post_icon_handler(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+
+    let name: String = sqlx::query_scalar("SELECT name from users where id = ?")
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let icon_hash = format!("{:x}", sha2::Sha256::digest(&req.image));
+    image_hashes.write().await.insert(name, icon_hash);
 
     let rs = sqlx::query("INSERT INTO icons (user_id, image) VALUES (?, ?)")
         .bind(user_id)
@@ -1578,7 +1621,7 @@ async fn register_handler(
 
     let output = tokio::process::Command::new("pdnsutil")
         .arg("add-record")
-        .arg("t.isucon.pw")
+        .arg("u.isucon.dev")
         .arg(&req.name)
         .arg("A")
         .arg("0")
@@ -1652,7 +1695,7 @@ async fn login_handler(
     if let Some(cookie_value) = cookie_store.store_session(sess).await? {
         let cookie =
             axum_extra::extract::cookie::Cookie::build(DEFAULT_SESSION_ID_KEY, cookie_value)
-                .domain("t.isucon.pw")
+                .domain("u.isucon.dev")
                 .max_age(time::Duration::minutes(1000))
                 .path("/")
                 .finish();
