@@ -1619,13 +1619,14 @@ async fn register_handler(
         .execute(&mut *tx)
         .await?;
 
-    let output = tokio::process::Command::new("pdnsutil")
-        .arg("add-record")
-        .arg("t.isucon.pw")
-        .arg(&req.name)
-        .arg("A")
-        .arg("0")
-        .arg(&*powerdns_subdomain_address)
+    let cmd = format!(
+        "sudo pdnsutil add-record t.isucon.pw {} A 0 {}",
+        &req.name, &*powerdns_subdomain_address
+    );
+    let output = tokio::process::Command::new("sudo")
+        .arg("ssh")
+        .arg("root@192.168.0.11")
+        .arg(&cmd)
         .output()
         .await?;
     if !output.status.success() {

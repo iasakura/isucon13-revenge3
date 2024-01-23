@@ -20,6 +20,12 @@
       with_fileglob:
         - ./ssh/*
 
+    - name: add pubkey to authorized keys
+      become: yes
+      become_user: root
+      ansible.builtin.shell: |
+        cat /root/.ssh/id_ed25519.pub >> /root/.ssh/authorized_keys
+
     - name: chmod keys
       become: yes
       become_user: root

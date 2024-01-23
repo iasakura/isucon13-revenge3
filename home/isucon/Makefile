@@ -1,5 +1,5 @@
 deploy:
-	sudo git pull origin main &&\
+	sudo git pull -f origin main --rebase &&\
 	cd /home/isucon/webapp/rust/ &&\
 	cargo build --release &&\
 	sudo systemctl restart isupipe-rust
