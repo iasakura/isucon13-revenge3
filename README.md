@@ -23,7 +23,15 @@ ansible-playbook -i hosts.yml init.yml
 
 ## 更新
 
+mainブランチの最新までサーバーを追従させる。
+
 ```
 ansible-playbook -i hosts.yml update.yml
 ```
 
+## おまけ: GitHubにサーバーのコピーを持ってくる
+
+1. init.ymlの`name update`をコメントアウト
+2. サーバーでsudo git push
+
+.gitignoreは工夫する必要あり。

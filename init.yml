@@ -40,6 +40,10 @@
       args:
         chdir: /
 
-    - name: update
+    - name: grant access
+      become: yes
+      become_user: root
       ansible.builtin.shell: |
-        PATH=$HOME/.cargo/bin:$PATH make deploy
+        echo "UPDATE mysql.user SET Host='%' WHERE User='isucon' AND Host='localhost'; FLUSH PRIVILEGES;" | mysql -u root -proot isupipe;
+        echo "GRANT ALL PRIVILEGES ON database_name.* TO 'isucon'@'%'; FLUSH PRIVILEGES;" | mysql -u root -proot isupipe;
+        systemctl restart mysql
