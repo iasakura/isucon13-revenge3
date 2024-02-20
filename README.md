@@ -20,6 +20,7 @@ ansible-playbook -i hosts.yml init.yml
 ```
 
 全サーバーがmainブランチを向くようになる。
+最初に各サーバーに対してsshをしておかないと、公開鍵のfingerprintの確認で止まるかも。
 
 ## 更新
 
