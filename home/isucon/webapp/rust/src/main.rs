@@ -6,7 +6,8 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use hyper::header::IF_NONE_MATCH;
 use hyper::HeaderMap;
 use sha2::digest::Digest as _;
-use sqlx::mysql::{MySqlConnection, MySqlPool};
+use sqlx::mysql::{MySqlArguments, MySqlConnection, MySqlPool, MySqlRow};
+use sqlx::{Encode, FromRow, MySql, Type};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -278,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 struct Tag {
     id: i64,
     name: String,
@@ -371,7 +372,7 @@ struct LivestreamModel {
     end_at: i64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 struct Livestream {
     id: i64,
     owner: User,
@@ -389,6 +390,7 @@ struct LivestreamTagModel {
     #[allow(unused)]
     id: i64,
     livestream_id: i64,
+    #[allow(unused)]
     tag_id: i64,
 }
 
@@ -796,21 +798,17 @@ async fn fill_livestream_response(
         .await?;
     let owner = fill_user_response(tx, owner_model).await?;
 
-    let livestream_tag_models: Vec<LivestreamTagModel> =
-        sqlx::query_as("SELECT * FROM livestream_tags WHERE livestream_id = ?")
+    let livestream_tag_models: Vec<TagModel> =
+        sqlx::query_as("SELECT tags.id, tags.name FROM livestream_tags INNER JOIN tags ON livestream_tags.tag_id = tags.id AND livestream_tags.livestream_id = ?")
             .bind(livestream_model.id)
             .fetch_all(&mut *tx)
             .await?;
 
     let mut tags = Vec::with_capacity(livestream_tag_models.len());
-    for livestream_tag_model in livestream_tag_models {
-        let tag_model: TagModel = sqlx::query_as("SELECT * FROM tags WHERE id = ?")
-            .bind(livestream_tag_model.tag_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    for tag in livestream_tag_models {
         tags.push(Tag {
-            id: tag_model.id,
-            name: tag_model.name,
+            id: tag.id,
+            name: tag.name,
         });
     }
 
@@ -1290,9 +1288,29 @@ async fn get_reactions_handler(
         .fetch_all(&mut *tx)
         .await?;
 
+    let user_ids = reaction_models
+        .iter()
+        .map(|r| r.user_id.clone())
+        .collect::<Vec<_>>();
+    let users = fetch_users(&mut tx, &user_ids)
+        .await?
+        .into_iter()
+        .map(|u| (u.id, u))
+        .collect::<HashMap<_, _>>();
+    let livestream = fetch_livestream(&mut tx, livestream_id).await?;
+
     let mut reactions = Vec::with_capacity(reaction_models.len());
     for reaction_model in reaction_models {
-        let reaction = fill_reaction_response(&mut tx, reaction_model).await?;
+        let reaction = Reaction {
+            id: reaction_model.id,
+            emoji_name: reaction_model.emoji_name,
+            user: users
+                .get(&reaction_model.user_id)
+                .ok_or(Error::NotFound("user is not found".into()))?
+                .clone(),
+            livestream: livestream.clone(),
+            created_at: reaction_model.created_at,
+        };
         reactions.push(reaction);
     }
 
@@ -1382,7 +1400,7 @@ struct UserModel {
     hashed_password: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 struct User {
     id: i64,
     name: String,
@@ -1394,7 +1412,7 @@ struct User {
     icon_hash: String,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
 struct Theme {
     id: i64,
     dark_mode: bool,
@@ -1783,6 +1801,98 @@ async fn fill_user_response(tx: &mut MySqlConnection, user_model: UserModel) -> 
         },
         icon_hash: format!("{:x}", icon_hash),
     })
+}
+
+fn create_in_query<T>(q: &str, args: &[T]) -> String {
+    let params = (0..args.len())
+        .map(|_| "?".to_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query_str = format!("{} IN ( {} )", q, params);
+    tracing::info!("query in: {}", query_str);
+    query_str
+}
+
+fn bind_query<
+    'a,
+    T: 'a + Send + Encode<'a, MySql> + Type<MySql> + Clone,
+    R: for<'r> FromRow<'r, MySqlRow>,
+>(
+    q: &'a str,
+    args: &[T],
+) -> sqlx::query::QueryAs<'a, MySql, R, MySqlArguments> {
+    let mut query = sqlx::query_as(q);
+    for a in args {
+        query = query.bind(a.clone());
+    }
+    query
+}
+
+async fn fetch_users(tx: &mut MySqlConnection, user_ids: &[i64]) -> sqlx::Result<Vec<User>> {
+    if user_ids.len() == 0 {
+        return Ok(vec![]);
+    }
+    let users: Vec<UserModel> = bind_query(
+        &create_in_query("SELECT * FROM users WHERE id", user_ids),
+        user_ids,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let themes: Vec<ThemeModel> = bind_query(
+        &create_in_query("SELECT * FROM themes WHERE user_id", user_ids),
+        user_ids,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let images: Vec<(i64, Vec<u8>)> = bind_query(
+        &create_in_query("SELECT user_id, image FROM icons WHERE user_id", user_ids),
+        user_ids,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut res = vec![];
+    let default_img = tokio::fs::read(FALLBACK_IMAGE).await?;
+    for id in user_ids {
+        let user = users.iter().find(|p| p.id == *id);
+        let theme = themes.iter().find(|t| t.id == *id);
+        let image = if let Some((_, image)) = images.iter().find(|(user_id, _t)| user_id == id) {
+            image
+        } else {
+            &default_img
+        };
+        use sha2::digest::Digest as _;
+        let icon_hash = sha2::Sha256::digest(image);
+
+        match (user, theme) {
+            (Some(user), Some(theme)) => res.push(User {
+                id: user.id,
+                name: user.name.clone(),
+                display_name: user.display_name.clone(),
+                description: user.description.clone(),
+                theme: Theme {
+                    id: theme.id,
+                    dark_mode: theme.dark_mode,
+                },
+                icon_hash: format!("{:x}", icon_hash),
+            }),
+            _ => (),
+        }
+    }
+    Ok(res)
+}
+
+async fn fetch_livestream(tx: &mut MySqlConnection, id: i64) -> sqlx::Result<Livestream> {
+    let livestream_model: LivestreamModel =
+        sqlx::query_as("SELECT * FROM livestreams WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    let livestream = fill_livestream_response(tx, livestream_model).await?;
+    Ok(livestream)
 }
 
 #[derive(Debug, serde::Serialize)]
