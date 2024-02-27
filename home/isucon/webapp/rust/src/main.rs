@@ -279,7 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 struct Tag {
     id: i64,
     name: String,
@@ -372,7 +372,7 @@ struct LivestreamModel {
     end_at: i64,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 struct Livestream {
     id: i64,
     owner: User,
@@ -797,21 +797,17 @@ async fn fill_livestream_response(
         .await?;
     let owner = fill_user_response(tx, owner_model).await?;
 
-    let livestream_tag_models: Vec<LivestreamTagModel> =
-        sqlx::query_as("SELECT * FROM livestream_tags WHERE livestream_id = ?")
+    let livestream_tag_models: Vec<TagModel> =
+        sqlx::query_as("SELECT tags.id, tags.name FROM livestream_tags WHERE livestream_id = ? INNER JOIN tags on tag_id = tags.id")
             .bind(livestream_model.id)
             .fetch_all(&mut *tx)
             .await?;
 
     let mut tags = Vec::with_capacity(livestream_tag_models.len());
-    for livestream_tag_model in livestream_tag_models {
-        let tag_model: TagModel = sqlx::query_as("SELECT * FROM tags WHERE id = ?")
-            .bind(livestream_tag_model.tag_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    for tag in livestream_tag_models {
         tags.push(Tag {
-            id: tag_model.id,
-            name: tag_model.name,
+            id: tag.id,
+            name: tag.name,
         });
     }
 
@@ -1295,11 +1291,25 @@ async fn get_reactions_handler(
         .iter()
         .map(|r| r.user_id.clone())
         .collect::<Vec<_>>();
-    let users = fetch_users(&mut tx, &user_ids).await?;
+    let users = fetch_users(&mut tx, &user_ids)
+        .await?
+        .into_iter()
+        .map(|u| (u.id, u))
+        .collect::<HashMap<_, _>>();
+    let livestream = fetch_livestream(&mut tx, livestream_id).await?;
 
     let mut reactions = Vec::with_capacity(reaction_models.len());
     for reaction_model in reaction_models {
-        let reaction = fill_reaction_response(&mut tx, reaction_model).await?;
+        let reaction = Reaction {
+            id: reaction_model.id,
+            emoji_name: reaction_model.emoji_name,
+            user: users
+                .get(&reaction_model.user_id)
+                .ok_or(Error::NotFound("user is not found".into()))?
+                .clone(),
+            livestream: livestream.clone(),
+            created_at: reaction_model.created_at,
+        };
         reactions.push(reaction);
     }
 
@@ -1389,7 +1399,7 @@ struct UserModel {
     hashed_password: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, Clone)]
 struct User {
     id: i64,
     name: String,
@@ -1401,7 +1411,7 @@ struct User {
     icon_hash: String,
 }
 
-#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
 struct Theme {
     id: i64,
     dark_mode: bool,
@@ -1819,7 +1829,7 @@ async fn fetch_users(tx: &mut MySqlConnection, user_ids: &[i64]) -> sqlx::Result
     for id in user_ids {
         let user = users.iter().find(|p| p.id == *id);
         let theme = themes.iter().find(|t| t.id == *id);
-        let image = if let Some((_, image)) = images.iter().find(|(user_id, t)| user_id == id) {
+        let image = if let Some((_, image)) = images.iter().find(|(user_id, _t)| user_id == id) {
             image
         } else {
             &default_img
@@ -1843,6 +1853,17 @@ async fn fetch_users(tx: &mut MySqlConnection, user_ids: &[i64]) -> sqlx::Result
         }
     }
     Ok(res)
+}
+
+async fn fetch_livestream(tx: &mut MySqlConnection, id: i64) -> sqlx::Result<Livestream> {
+    let livestream_model: LivestreamModel =
+        sqlx::query_as("SELECT * FROM livestreams WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    let livestream = fill_livestream_response(tx, livestream_model).await?;
+    Ok(livestream)
 }
 
 #[derive(Debug, serde::Serialize)]
