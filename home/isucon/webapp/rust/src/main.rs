@@ -5,6 +5,7 @@ use axum_extra::extract::cookie::SignedCookieJar;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use hyper::header::IF_NONE_MATCH;
 use hyper::HeaderMap;
+use itertools::IterTools;
 use sha2::digest::Digest as _;
 use sqlx::mysql::{MySqlConnection, MySqlPool};
 use std::borrow::Cow;
@@ -1290,6 +1291,12 @@ async fn get_reactions_handler(
         .fetch_all(&mut *tx)
         .await?;
 
+    let user_ids = reaction_models
+        .iter()
+        .map(|r| r.user_id.clone())
+        .collect::<Vec<_>>();
+    let users = fetch_users(&mut tx, &user_ids).await?;
+
     let mut reactions = Vec::with_capacity(reaction_models.len());
     for reaction_model in reaction_models {
         let reaction = fill_reaction_response(&mut tx, reaction_model).await?;
@@ -1783,6 +1790,59 @@ async fn fill_user_response(tx: &mut MySqlConnection, user_model: UserModel) -> 
         },
         icon_hash: format!("{:x}", icon_hash),
     })
+}
+
+async fn fetch_users(tx: &mut MySqlConnection, user_ids: &[i64]) -> sqlx::Result<Vec<User>> {
+    let ids: String = user_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let users: Vec<UserModel> = sqlx::query_as("SELECT * FROM users WHERE id = (?)")
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let themes: Vec<ThemeModel> = sqlx::query_as("SELECT * FROM themes WHERE user_id IN (?)")
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let images: Vec<(i64, Vec<u8>)> =
+        sqlx::query_as("SELECT (user_id, image) FROM icons WHERE user_id IN (?)")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?;
+
+    let mut res = vec![];
+    let default_img = tokio::fs::read(FALLBACK_IMAGE).await?;
+    for id in user_ids {
+        let user = users.iter().find(|p| p.id == *id);
+        let theme = themes.iter().find(|t| t.id == *id);
+        let image = if let Some((_, image)) = images.iter().find(|(user_id, t)| user_id == id) {
+            image
+        } else {
+            &default_img
+        };
+        use sha2::digest::Digest as _;
+        let icon_hash = sha2::Sha256::digest(image);
+
+        match (user, theme) {
+            (Some(user), Some(theme)) => res.push(User {
+                id: user.id,
+                name: user.name.clone(),
+                display_name: user.display_name.clone(),
+                description: user.description.clone(),
+                theme: Theme {
+                    id: theme.id,
+                    dark_mode: theme.dark_mode,
+                },
+                icon_hash: format!("{:x}", icon_hash),
+            }),
+            _ => (),
+        }
+    }
+    Ok(res)
 }
 
 #[derive(Debug, serde::Serialize)]
