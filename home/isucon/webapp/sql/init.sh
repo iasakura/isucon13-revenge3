@@ -68,6 +68,6 @@ mysql -u"$ISUCON_DB_USER" \
 		--port "$ISUCON_DB_PORT" \
 		"$ISUCON_DB_NAME" < initial_livecomments.sql
 
-bash ../pdns/init_zone.sh
+sudo ssh 192.168.0.11 bash /home/isucon/webapp/pdns/init_zone.sh
 
 ./add_index.sh
