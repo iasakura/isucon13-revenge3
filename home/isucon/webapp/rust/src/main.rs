@@ -80,6 +80,7 @@ struct AppState {
     powerdns_subdomain_address: Arc<String>,
     // SHA256 Map of all images
     image_hashes: Arc<RwLock<HashMap<String, String>>>,
+    tags: Arc<RwLock<Vec<Tag>>>,
 }
 impl axum::extract::FromRef<AppState> for axum_extra::extract::cookie::Key {
     fn from_ref(state: &AppState) -> Self {
@@ -120,7 +121,9 @@ fn build_mysql_options() -> sqlx::mysql::MySqlConnectOptions {
     options
 }
 
-async fn initialize_handler() -> Result<axum::Json<InitializeResponse>, Error> {
+async fn initialize_handler(
+    State(AppState { pool, tags, .. }): State<AppState>,
+) -> Result<axum::Json<InitializeResponse>, Error> {
     let output = tokio::process::Command::new("../sql/init.sh")
         .output()
         .await?;
@@ -131,6 +134,22 @@ async fn initialize_handler() -> Result<axum::Json<InitializeResponse>, Error> {
             String::from_utf8_lossy(&output.stderr),
         )));
     }
+
+    tracing::info!("tags: {:?}", tags.read().await);
+    if tags.read().await.len() == 0 {
+        let mut tx = pool.begin().await?;
+        let tag_models: Vec<TagModel> = sqlx::query_as("SELECT * FROM tags")
+            .fetch_all(&mut *tx)
+            .await?;
+        tracing::info!("tag_models: {:?}", tag_models);
+
+        tags.write()
+            .await
+            .extend(tag_models.into_iter().map(|tag| Tag {
+                id: tag.id,
+                name: tag.name,
+            }))
+    };
 
     Ok(axum::Json(InitializeResponse { language: "rust" }))
 }
@@ -263,6 +282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             key: axum_extra::extract::cookie::Key::derive_from(&secret),
             powerdns_subdomain_address: Arc::new(powerdns_subdomain_address),
             image_hashes: Arc::new(RwLock::new(HashMap::new())),
+            tags: Arc::new(RwLock::new(vec![])),
         })
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
@@ -539,7 +559,7 @@ struct SearchLivestreamsQuery {
 }
 
 async fn search_livestreams_handler(
-    State(AppState { pool, .. }): State<AppState>,
+    State(AppState { pool, tags, .. }): State<AppState>,
     Query(SearchLivestreamsQuery {
         tag: key_tag_name,
         limit,
@@ -559,42 +579,33 @@ async fn search_livestreams_handler(
         sqlx::query_as(&query).fetch_all(&mut *tx).await?
     } else {
         // タグによる取得
-        let tag_id_list: Vec<i64> = sqlx::query_scalar("SELECT id FROM tags WHERE name = ?")
+        let mut query = format!(
+            r#"
+            SELECT livestreams.* FROM tags
+                INNER JOIN livestream_tags ON tags.name = ? AND livestream_tags.tag_id = tags.id
+                INNER JOIN livestreams ON livestreams.id = livestream_tags.livestream_id
+                ORDER BY livestream_id DESC
+        "#
+        );
+        if !limit.is_empty() {
+            let limit: i64 = limit
+                .parse()
+                .map_err(|_| Error::BadRequest("failed to parse limit".into()))?;
+            query = format!("{} LIMIT {}", query, limit);
+        }
+
+        let livestream_models: Vec<LivestreamModel> = sqlx::query_as(&query)
             .bind(key_tag_name)
             .fetch_all(&mut *tx)
             .await?;
-
-        let mut query_builder = sqlx::query_builder::QueryBuilder::new(
-            "SELECT * FROM livestream_tags WHERE tag_id IN (",
-        );
-        let mut separated = query_builder.separated(", ");
-        for tag_id in tag_id_list {
-            separated.push_bind(tag_id);
-        }
-        separated.push_unseparated(") ORDER BY livestream_id DESC");
-        let key_tagged_livestreams: Vec<LivestreamTagModel> =
-            query_builder.build_query_as().fetch_all(&mut *tx).await?;
-
-        let mut livestream_models = Vec::new();
-        for key_tagged_livestream in key_tagged_livestreams {
-            let ls = sqlx::query_as("SELECT * FROM livestreams WHERE id = ?")
-                .bind(key_tagged_livestream.livestream_id)
-                .fetch_one(&mut *tx)
-                .await?;
-            livestream_models.push(ls);
-        }
         livestream_models
     };
+    tracing::info!("found {} livestreams", livestream_models.len());
 
-    let mut livestreams = Vec::with_capacity(livestream_models.len());
-    for livestream_model in livestream_models {
-        let livestream = fill_livestream_response(&mut tx, livestream_model).await?;
-        livestreams.push(livestream);
-    }
-
+    let res = fill_livestream_responses(&mut *tx, livestream_models, &*tags.read().await).await?;
     tx.commit().await?;
 
-    Ok(axum::Json(livestreams))
+    Ok(axum::Json(res))
 }
 
 async fn get_my_livestreams_handler(
@@ -823,6 +834,73 @@ async fn fill_livestream_response(
         start_at: livestream_model.start_at,
         end_at: livestream_model.end_at,
     })
+}
+
+async fn fill_livestream_responses(
+    tx: &mut MySqlConnection,
+    livestream_model: Vec<LivestreamModel>,
+    tags: &Vec<Tag>,
+) -> Result<Vec<Livestream>, Error> {
+    let owner = fetch_users(
+        tx,
+        &livestream_model
+            .iter()
+            .map(|m| m.user_id)
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+
+    let query = r#"
+        SELECT * FROM livestream_tags WHERE livestream_tags.livestream_id IN (
+            SELECT jt.id FROM JSON_TABLE(?, "$[*]" COLUMNS(id BIGINT PATH "$")) as jt
+        )
+    "#;
+    let livestream_tag_models: Vec<LivestreamTagModel> = sqlx::query_as(query)
+        .bind(sqlx::types::Json(
+            livestream_model.iter().map(|lm| lm.id).collect::<Vec<_>>(),
+        ))
+        .fetch_all(&mut *tx)
+        .await?;
+
+    let mut livestream_tags = HashMap::new();
+    for lm_tag in livestream_tag_models {
+        let ls_tags = livestream_tags
+            .entry(lm_tag.livestream_id)
+            .or_insert(vec![]);
+        if let Some(tag) = tags.iter().find(|t| t.id == lm_tag.tag_id) {
+            ls_tags.push(tag.clone());
+        }
+    }
+
+    let res = livestream_model
+        .into_iter()
+        .map(|livestream_model| {
+            let owner = owner
+                .iter()
+                .find(|u| u.id == livestream_model.user_id)
+                .ok_or(Error::NotFound(
+                    format!("Cannot find user {}", livestream_model.user_id).into(),
+                ));
+            let g = vec![];
+            let tags = livestream_tags.get(&livestream_model.id).unwrap_or(&g);
+            match owner {
+                Ok(owner) => Ok(Livestream {
+                    id: livestream_model.id,
+                    owner: owner.clone(),
+                    title: livestream_model.title,
+                    tags: tags.clone(),
+                    description: livestream_model.description,
+                    playlist_url: livestream_model.playlist_url,
+                    thumbnail_url: livestream_model.thumbnail_url,
+                    start_at: livestream_model.start_at,
+                    end_at: livestream_model.end_at,
+                }),
+                Err(e) => Err(e),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(res)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1737,20 +1815,16 @@ async fn get_user_handler(
 }
 
 async fn verify_user_session(jar: &SignedCookieJar) -> Result<(), Error> {
-    tracing::info!("x");
     let cookie = jar
         .get(DEFAULT_SESSION_ID_KEY)
         .ok_or(Error::Forbidden("".into()))?;
-    tracing::info!("a");
     let sess = CookieStore::new()
         .load_session(cookie.value().to_owned())
         .await?
         .ok_or(Error::Forbidden("".into()))?;
-    tracing::info!("b");
     let session_expires: i64 = sess
         .get(DEFUALT_SESSION_EXPIRES_KEY)
         .ok_or(Error::Forbidden("".into()))?;
-    tracing::info!("c");
     let now = Utc::now();
     if now.timestamp() > session_expires {
         return Err(Error::Unauthorized("session has expired".into()));
@@ -1795,7 +1869,6 @@ fn create_in_query<T>(q: &str, args: &[T]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let query_str = format!("{} IN ( {} )", q, params);
-    tracing::info!("query in: {}", query_str);
     query_str
 }
 
@@ -1843,7 +1916,7 @@ async fn fetch_users(tx: &mut MySqlConnection, user_ids: &[i64]) -> sqlx::Result
     let default_img = tokio::fs::read(FALLBACK_IMAGE).await?;
     for id in user_ids {
         let user = users.iter().find(|p| p.id == *id);
-        let theme = themes.iter().find(|t| t.id == *id);
+        let theme = themes.iter().find(|t| t.user_id == *id);
         let image = if let Some((_, image)) = images.iter().find(|(user_id, _t)| user_id == id) {
             image
         } else {
